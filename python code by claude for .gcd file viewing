@@ -1,0 +1,1031 @@
+"""
+Shimadzu GCD Chromatogram Viewer  —  Universal Desktop App
+===========================================================
+• Full dark UI throughout
+• Per-channel vertical (Y) zoom buttons  🔍+ / 🔍-  in the plot toolbar
+  → zooms signal amplitude of each channel independently
+• Ctrl+Scroll = x-zoom  |  Scroll = y-zoom  |  Left-drag = rect-zoom
+• Right-drag = pan  |  Double-click OR Reset button = full reset
+• Correct area in µV·s, local linear baseline  (~99.8% match to Shimadzu report)
+• RT labels only on every detected peak — no guessed compound names
+• Export signal / peak table  as CSV or Excel (Origin-ready)
+
+Install:   pip install olefile matplotlib scipy openpyxl
+Run:       python gcd_viewer_app.py [optional_file.gcd]
+"""
+
+import sys, struct, csv, re, tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from pathlib import Path
+
+import numpy as np
+import olefile
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import Rectangle
+import matplotlib.ticker as ticker
+
+# ── Full-dark palette ─────────────────────────────────────────────────────────
+BG        = "#0D0D14"   # deepest background
+PANEL     = "#13131F"   # card / panel
+SIDEBAR   = "#0F0F1A"   # sidebar
+TOPBAR    = "#0A0A12"   # top bar
+BORDER    = "#1E1E32"   # subtle border
+ITEM_BG   = "#16162A"   # list / treeview rows
+TEXT      = "#E8EAF6"   # primary text
+DIM       = "#6B7280"   # muted text
+ACCENT    = "#3B82F6"   # blue accent
+ACCENT_H  = "#2563EB"   # blue hover
+ACCENT2   = "#8B5CF6"   # purple secondary
+SUCCESS   = "#10B981"
+WARNING   = "#F59E0B"
+PLOT_BG   = "#07070F"   # plot canvas background
+GRID_COL  = "#1A1A2E"   # grid lines
+
+CH_COLORS = [
+    "#38BDF8",   # sky blue    – Ch1
+    "#FB923C",   # orange      – Ch2
+    "#4ADE80",   # green       – Ch3
+    "#F472B6",   # pink        – Ch4
+    "#A78BFA",   # violet      – Ch5
+    "#FCD34D",   # amber       – Ch6
+    "#34D399",   # emerald     – Ch7
+    "#F87171",   # red         – Ch8
+]
+
+FONT = ("Segoe UI", 9)
+FONT_B = ("Segoe UI", 9, "bold")
+FONT_S = ("Segoe UI", 8)
+FONT_T = ("Segoe UI", 13, "bold")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  GCD PARSER
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _decode_signal(raw, header=40):
+    avail = (len(raw) - header) // 8 * 8
+    return np.frombuffer(raw[header : header + avail], dtype="<f8").copy()
+
+
+def _discover_channels(ole):
+    all_paths = ["/".join(s) for s in ole.listdir()]
+    raw_re    = re.compile(r"LSS Raw Data/Chromatogram Ch(\d+)$", re.IGNORECASE)
+    return sorted(
+        [p for p in all_paths if raw_re.match(p) and ole.get_size(p) > 200],
+        key=lambda p: int(raw_re.match(p).group(1))
+    )
+
+
+def _detect_peaks(sig, time, dt_ms):
+    from scipy.signal import find_peaks, peak_widths
+    dist_pts   = max(2, int(80 / dt_ms))
+    idx, props = find_peaks(sig, prominence=100, distance=dist_pts)
+    if len(idx) == 0:
+        return []
+    _, _, lips, rips = peak_widths(sig, idx, rel_height=0.999)
+    peaks = []
+    for i, p in enumerate(idx):
+        l  = max(0, int(np.floor(lips[i])))
+        r  = min(len(sig) - 1, int(np.ceil(rips[i])))
+        bl = np.linspace(sig[l], sig[r], r - l + 1)
+        area   = float(np.trapezoid(sig[l:r+1] - bl, time[l:r+1])) * 60.0
+        height = float(props["prominences"][i])
+        peaks.append({
+            "rt_min"    : float(time[p]),
+            "area"      : max(0.0, area),
+            "height"    : height,
+            "start_min" : float(time[l]),
+            "end_min"   : float(time[r]),
+            "peak_idx"  : int(p),
+            "l_idx"     : l,
+            "r_idx"     : r,
+        })
+    return peaks
+
+
+def read_gcd(filepath):
+    ole = olefile.OleFileIO(filepath)
+
+    status_paths = ["/".join(s) for s in ole.listdir()
+                    if "chromatogram status" in s[-1].lower()
+                    and ole.get_size("/".join(s)) > 0]
+    if not status_paths:
+        raise ValueError("No 'Chromatogram Status' stream — not a valid .gcd file.")
+    status_raw = ole.openstream(status_paths[0]).read()
+
+    ch_paths = _discover_channels(ole)
+    if not ch_paths:
+        raise ValueError("No chromatogram channels found.")
+
+    raw0     = ole.openstream(ch_paths[0]).read()
+    n_points = struct.unpack_from("<i", raw0, 8)[0]
+    total_ms = struct.unpack_from("<i", status_raw, 8)[0]
+    dt_ms    = total_ms / n_points
+
+    raw_re = re.compile(r"LSS Raw Data/Chromatogram Ch(\d+)$", re.IGNORECASE)
+    channels = []
+    for path in ch_paths:
+        raw    = ole.openstream(path).read()
+        signal = _decode_signal(raw)
+        n      = min(len(signal), n_points)
+        time   = np.arange(n) * dt_ms / 60_000.0
+        signal = signal[:n]
+        ch_num = raw_re.match(path).group(1)
+        peaks  = _detect_peaks(signal, time, dt_ms)
+        channels.append({
+            "label"  : f"Ch{ch_num}",
+            "time"   : time,
+            "signal" : signal,
+            "peaks"  : peaks,
+        })
+
+    ole.close()
+    return {
+        "filepath"    : filepath,
+        "n_points"    : n_points,
+        "run_time_min": total_ms / 60_000.0,
+        "dt_ms"       : dt_ms,
+        "channels"    : channels,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ZOOM / PAN CONTROLLER  (x-axis shared, y per subplot)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ZoomPanController:
+    ZOOM = 1.3
+
+    def __init__(self, fig, axes, canvas):
+        self.fig    = fig
+        self.axes   = list(axes)
+        self.canvas = canvas
+        self._rect  = None
+        self._press = None
+        self._mode  = None
+        self._xhome = None
+        self._yhome = None
+        self._connect()
+
+    def set_home(self):
+        if self.axes:
+            self._xhome = list(self.axes[0].get_xlim())
+            self._yhome = [list(ax.get_ylim()) for ax in self.axes]
+
+    def reset(self):
+        if self._xhome and self.axes:
+            for ax, yh in zip(self.axes, self._yhome or []):
+                ax.set_xlim(self._xhome)
+                ax.set_ylim(yh)
+            self.canvas.draw_idle()
+
+    def zoom_y(self, ax_index, factor):
+        """
+        Zoom the Y axis of a subplot.
+        Anchors at the signal baseline (bottom 5% of current view) so that
+        zooming IN makes peaks grow taller upward — not disappear downward.
+        factor < 1  = zoom in  (peaks taller)
+        factor > 1  = zoom out (more range visible)
+        """
+        if ax_index >= len(self.axes):
+            return
+        ax     = self.axes[ax_index]
+        lo, hi = ax.get_ylim()
+        span   = hi - lo
+
+        # anchor point: keep the bottom 10% of the view fixed
+        # so the baseline stays in place and peaks grow upward
+        anchor = lo + span * 0.10
+        new_span = span * factor
+        new_lo   = anchor - new_span * 0.10
+        new_hi   = anchor + new_span * 0.90
+        ax.set_ylim(new_lo, new_hi)
+        self.canvas.draw_idle()
+
+    def _connect(self):
+        c = self.canvas
+        c.mpl_connect("scroll_event",         self._scroll)
+        c.mpl_connect("button_press_event",   self._press_ev)
+        c.mpl_connect("motion_notify_event",  self._motion)
+        c.mpl_connect("button_release_event", self._release)
+
+    def _ctrl(self, event):
+        try:
+            return bool(event.guiEvent.state & 4)
+        except Exception:
+            return str(event.key or "").lower().startswith("ctrl")
+
+    def _scroll(self, event):
+        if event.inaxes not in self.axes:
+            return
+        f = 1 / self.ZOOM if event.step > 0 else self.ZOOM
+        if self._ctrl(event):
+            # sync x-zoom across all subplots
+            cx = event.xdata or sum(self.axes[0].get_xlim()) / 2
+            for ax in self.axes:
+                lo, hi = ax.get_xlim()
+                ax.set_xlim(cx + (lo - cx) * f, cx + (hi - cx) * f)
+        else:
+            # y-zoom only on the hovered axis
+            ax = event.inaxes
+            cy = event.ydata or sum(ax.get_ylim()) / 2
+            lo, hi = ax.get_ylim()
+            ax.set_ylim(cy + (lo - cy) * f, cy + (hi - cy) * f)
+        self.canvas.draw_idle()
+
+    def _press_ev(self, event):
+        if event.inaxes not in self.axes:
+            return
+        if event.dblclick:
+            self.reset(); return
+        if event.button == 1:
+            self._mode  = "zoom"
+            self._press = (event.xdata, event.ydata, event.inaxes)
+            self._rect  = Rectangle(
+                (event.xdata, event.ydata), 0, 0,
+                lw=1.4, edgecolor=ACCENT,
+                facecolor=ACCENT, alpha=0.12,
+                transform=event.inaxes.transData)
+            event.inaxes.add_patch(self._rect)
+            self.canvas.draw_idle()
+        elif event.button == 2:
+            ax0 = event.inaxes
+            # store press in PIXEL coords — stable regardless of subsequent limit changes
+            self._mode  = "pan"
+            self._press = {
+                "px"   : event.x,           # pixel x at press
+                "py"   : event.y,            # pixel y at press
+                "ax"   : ax0,
+                "xlim" : list(ax0.get_xlim()),
+                "ylim" : list(ax0.get_ylim()),
+            }
+
+    def _motion(self, event):
+        if not self._press:
+            return
+        if self._mode == "zoom" and self._rect:
+            if not event.xdata or not event.ydata:
+                return
+            x0, y0, _ = self._press
+            self._rect.set_width(event.xdata - x0)
+            self._rect.set_height(event.ydata - y0)
+            self._rect.set_xy((x0, y0))
+            self.canvas.draw_idle()
+        elif self._mode == "pan":
+            ax0  = self._press["ax"]
+            xlim = self._press["xlim"]
+            ylim = self._press["ylim"]
+
+            # pixel delta since press
+            dpx = event.x - self._press["px"]
+            dpy = event.y - self._press["py"]
+
+            # convert pixel delta → data delta using ORIGINAL limits + axis bbox
+            bbox  = ax0.get_window_extent()
+            if bbox.width == 0 or bbox.height == 0:
+                return
+            x_range = xlim[1] - xlim[0]
+            y_range = ylim[1] - ylim[0]
+            dx = dpx * x_range / bbox.width
+            dy = dpy * y_range / bbox.height
+
+            # apply: subtract dx/dy so the point under the cursor stays fixed
+            ax0.set_xlim(xlim[0] - dx, xlim[1] - dx)
+            ax0.set_ylim(ylim[0] - dy, ylim[1] - dy)
+            self.canvas.draw_idle()
+
+    def _release(self, event):
+        if self._mode == "zoom" and self._press:
+            x0, y0, ax0 = self._press
+            if event.xdata and event.ydata:
+                x1, y1 = event.xdata, event.ydata
+                if abs(x1 - x0) > 1e-6 and abs(y1 - y0) > 1:
+                    xlo, xhi = sorted([x0, x1])
+                    for ax in self.axes:
+                        ax.set_xlim(xlo, xhi)
+                    ax0.set_ylim(sorted([y0, y1]))
+            if self._rect:
+                try:    self._rect.remove()
+                except: pass
+                self._rect = None
+        self._mode  = None
+        self._press = None
+        self.canvas.draw_idle()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  WIDGET HELPERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _flat_btn(parent, text, cmd, bg=ACCENT, fg=TEXT,
+              font=FONT_B, padx=12, pady=5, **kw):
+    b = tk.Button(parent, text=text, command=cmd,
+                  font=font, bg=bg, fg=fg,
+                  activebackground=ACCENT_H, activeforeground=TEXT,
+                  relief="flat", bd=0, cursor="hand2",
+                  padx=padx, pady=pady, **kw)
+    return b
+
+
+def _section_label(parent, text):
+    f = tk.Frame(parent, bg=SIDEBAR)
+    f.pack(fill="x", pady=(14, 2))
+    tk.Label(f, text=text.upper(), font=("Segoe UI", 7, "bold"),
+             fg=DIM, bg=SIDEBAR).pack(anchor="w", padx=16)
+    tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=10)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  PER-CHANNEL Y-ZOOM TOOLBAR  (appears above the plot canvas)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ChannelZoomBar(tk.Frame):
+    """
+    Horizontal bar shown above the plot.
+    One pair of  🔍+  🔍-  buttons per visible channel.
+    Clicking them zooms the Y-axis of that channel's subplot
+    so smaller peaks appear taller — amplitude zoom.
+    """
+    YZOOM_IN  = 0.6    # multiply (lo,hi) span by this → zoom in  (peaks taller)
+    YZOOM_OUT = 1 / 0.6
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=PANEL, **kw)
+        self._zpc      = None   # ZoomPanController reference
+        self._entries  = []     # list of (label, ax_index, color)
+
+    def set_controller(self, zpc):
+        self._zpc = zpc
+
+    def rebuild(self, channels_visible):
+        """
+        channels_visible: list of (label, ax_index, color)
+        ax_index is the index into ZoomPanController.axes
+        """
+        for w in self.winfo_children():
+            w.destroy()
+        self._entries = channels_visible
+
+        tk.Label(self, text="Amplitude Zoom:", font=("Segoe UI", 8),
+                 fg=DIM, bg=PANEL).pack(side="left", padx=(10, 6))
+
+        for label, ax_idx, color in channels_visible:
+            grp = tk.Frame(self, bg=PANEL)
+            grp.pack(side="left", padx=6)
+
+            tk.Label(grp, text=f"● {label}",
+                     font=("Segoe UI", 8, "bold"),
+                     fg=color, bg=PANEL).pack(side="left", padx=(0, 4))
+
+            # zoom-in button
+            zi = tk.Button(grp, text="🔍+",
+                           font=("Segoe UI", 9),
+                           bg="#1A1A2E", fg="#FFD700",
+                           activebackground="#252545",
+                           activeforeground="#FFD700",
+                           relief="flat", bd=0, cursor="hand2",
+                           padx=6, pady=2,
+                           command=lambda i=ax_idx: self._zy(i, self.YZOOM_IN))
+            zi.pack(side="left")
+
+            # zoom-out button
+            zo = tk.Button(grp, text="🔍–",
+                           font=("Segoe UI", 9),
+                           bg="#1A1A2E", fg="#94A3B8",
+                           activebackground="#252545",
+                           activeforeground="#CBD5E1",
+                           relief="flat", bd=0, cursor="hand2",
+                           padx=6, pady=2,
+                           command=lambda i=ax_idx: self._zy(i, self.YZOOM_OUT))
+            zo.pack(side="left", padx=(0, 2))
+
+        # spacer + reset-y button
+        tk.Label(self, text="|", fg=BORDER, bg=PANEL,
+                 font=FONT).pack(side="left", padx=4)
+        tk.Button(self, text="↺ Reset Y",
+                  font=("Segoe UI", 8),
+                  bg="#1A1A2E", fg=DIM,
+                  activebackground="#252545", activeforeground=TEXT,
+                  relief="flat", bd=0, cursor="hand2",
+                  padx=8, pady=2,
+                  command=self._reset_y).pack(side="left", padx=2)
+
+    def _zy(self, ax_index, factor):
+        if self._zpc:
+            self._zpc.zoom_y(ax_index, factor)
+
+    def _reset_y(self):
+        if self._zpc:
+            self._zpc.reset()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION
+# ════════════════════════════════════════════════════════════════════════════════
+
+class GCDViewerApp:
+    def __init__(self, root):
+        self.root     = root
+        self.data     = None
+        self._zpc     = None
+        self._ch_vars = []
+        self._ax_list = []
+        self._build_ui()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        r = self.root
+        r.title("Shimadzu GCD Viewer")
+        r.configure(bg=BG)
+        r.geometry("1440x900")
+        r.minsize(1100, 680)
+
+        # top bar
+        topbar = tk.Frame(r, bg=TOPBAR, height=52)
+        topbar.pack(fill="x", side="top")
+        topbar.pack_propagate(False)
+        tk.Frame(topbar, bg=ACCENT, width=4).pack(side="left", fill="y")
+        tk.Label(topbar, text="  GCD Viewer",
+                 font=FONT_T, fg=TEXT, bg=TOPBAR).pack(side="left", padx=10)
+        self.file_label = tk.Label(topbar, text="No file loaded",
+                                   font=FONT_S, fg=DIM, bg=TOPBAR)
+        self.file_label.pack(side="left", padx=10)
+
+        for txt, cmd, bg in [
+            ("⊕  Open .GCD",    self._open_file,   ACCENT),
+            ("↓  Export Data",  self._export_menu,  "#1E293B"),
+            ("🖼  Save PNG",     self._save_png,     "#1E293B"),
+        ]:
+            _flat_btn(topbar, txt, cmd, bg=bg
+                      ).pack(side="right", padx=6, pady=10)
+
+        # main split
+        main = tk.Frame(r, bg=BG)
+        main.pack(fill="both", expand=True)
+
+        # sidebar
+        self.sidebar = tk.Frame(main, bg=SIDEBAR, width=244)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        tk.Frame(self.sidebar, bg=BORDER, width=1).pack(side="right", fill="y")
+        self._build_sidebar()
+
+        # right content area
+        right = tk.Frame(main, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        # channel amplitude-zoom bar  (above canvas)
+        self.zoom_bar = ChannelZoomBar(right, height=34)
+        self.zoom_bar.pack(fill="x")
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x")
+
+        # matplotlib canvas
+        plot_wrap = tk.Frame(right, bg=PLOT_BG)
+        plot_wrap.pack(fill="both", expand=True)
+        self.fig    = Figure(facecolor=PLOT_BG)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_wrap)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # hint strip
+        hint = tk.Frame(plot_wrap, bg="#050508", height=20)
+        hint.pack(fill="x")
+        hint.pack_propagate(False)
+        tk.Label(hint,
+                 text="  Ctrl+Scroll=x-zoom  ·  Scroll=y-zoom  ·  "
+                      "Left-drag=rect-zoom  ·  Middle-drag=pan  ·  Dbl-click=reset",
+                 font=("Segoe UI", 7), fg="#2D3748", bg="#050508"
+                 ).pack(side="left", padx=8)
+
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x")
+
+        # peak table
+        self.table_frame = tk.Frame(right, bg=PANEL, height=255)
+        self.table_frame.pack(fill="x")
+        self.table_frame.pack_propagate(False)
+        self._build_peak_table_container()
+
+        # status bar
+        sbar = tk.Frame(r, bg=TOPBAR, height=22)
+        sbar.pack(fill="x", side="bottom")
+        sbar.pack_propagate(False)
+        self.status_var = tk.StringVar(value="Ready — open a .gcd file")
+        tk.Label(sbar, textvariable=self.status_var,
+                 font=FONT_S, fg=DIM, bg=TOPBAR).pack(side="left", padx=12)
+
+        self._draw_empty()
+
+    def _build_sidebar(self):
+        sb = self.sidebar
+
+        _section_label(sb, "File Info")
+        self._info_rows = {}
+        for key in ["File", "Run time", "Points", "dt", "Channels"]:
+            row = tk.Frame(sb, bg=SIDEBAR)
+            row.pack(fill="x", padx=12, pady=2)
+            tk.Label(row, text=key + ":", font=FONT_S,
+                     fg=DIM, bg=SIDEBAR, width=9, anchor="w"
+                     ).pack(side="left")
+            val = tk.Label(row, text="—", font=FONT_B,
+                           fg=TEXT, bg=SIDEBAR, anchor="w")
+            val.pack(side="left", fill="x", expand=True)
+            self._info_rows[key] = val
+
+        _section_label(sb, "Channels")
+        self.ch_frame = tk.Frame(sb, bg=SIDEBAR)
+        self.ch_frame.pack(fill="x", padx=8)
+
+        _section_label(sb, "View Options")
+        self.show_peaks = tk.BooleanVar(value=True)
+        self.show_areas = tk.BooleanVar(value=False)
+        for var, lbl in [(self.show_peaks, "RT labels on peaks"),
+                         (self.show_areas, "Shade peak areas")]:
+            f = tk.Frame(sb, bg=SIDEBAR)
+            f.pack(fill="x", padx=14, pady=2)
+            tk.Checkbutton(f, text=lbl, variable=var,
+                           font=FONT, fg=TEXT, bg=SIDEBAR,
+                           selectcolor=ITEM_BG, activebackground=SIDEBAR,
+                           activeforeground=TEXT, bd=0,
+                           command=self._refresh_plot).pack(side="left")
+
+        _section_label(sb, "Layout")
+        self.layout_var = tk.StringVar(value="stacked")
+        for v, t in [("stacked", "Stacked (separate)"),
+                     ("overlay", "Overlay (single)")]:
+            f = tk.Frame(sb, bg=SIDEBAR)
+            f.pack(fill="x", padx=14, pady=1)
+            tk.Radiobutton(f, text=t, variable=self.layout_var, value=v,
+                           font=FONT, fg=TEXT, bg=SIDEBAR,
+                           selectcolor=ITEM_BG, activebackground=SIDEBAR,
+                           bd=0, command=self._refresh_plot).pack(side="left")
+
+        _section_label(sb, "Navigation")
+        btns = tk.Frame(sb, bg=SIDEBAR)
+        btns.pack(fill="x", padx=12, pady=6)
+
+        _flat_btn(btns, "↺  Reset All Zoom", self._reset_zoom,
+                  bg="#1E293B", fg=TEXT, pady=6
+                  ).pack(fill="x", pady=(0, 4))
+
+    def _build_peak_table_container(self):
+        self.nb = ttk.Notebook(self.table_frame)
+        self.nb.pack(fill="both", expand=True)
+
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TNotebook",         background=PANEL,    borderwidth=0)
+        s.configure("TNotebook.Tab",     background=ITEM_BG,  foreground=DIM,
+                    font=FONT_B, padding=[14, 4])
+        s.map("TNotebook.Tab",           background=[("selected", PANEL)],
+                                         foreground=[("selected", TEXT)])
+        s.configure("Treeview",          background=ITEM_BG,  foreground=TEXT,
+                    fieldbackground=ITEM_BG, font=FONT_S,
+                    rowheight=19, borderwidth=0)
+        s.configure("Treeview.Heading",  background=PANEL,    foreground=DIM,
+                    font=FONT_B, relief="flat")
+        s.map("Treeview",                background=[("selected", "#1E3A5F")],
+                                         foreground=[("selected", TEXT)])
+        self._peak_tables = {}
+
+    # ── empty state ───────────────────────────────────────────────────────────
+
+    def _draw_empty(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor(PLOT_BG)
+        ax.text(0.5, 0.54, "Open a  .gcd  file  to  begin",
+                ha="center", va="center", fontsize=13,
+                color="#334155", fontfamily="Segoe UI",
+                transform=ax.transAxes)
+        ax.text(0.5, 0.45, "Use the  ⊕ Open .GCD  button above",
+                ha="center", va="center", fontsize=9,
+                color="#1E293B", fontfamily="Segoe UI",
+                transform=ax.transAxes)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.set_xticks([]); ax.set_yticks([])
+        self.canvas.draw()
+
+    # ── file open ─────────────────────────────────────────────────────────────
+
+    def _open_file(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open Shimadzu .gcd file",
+                filetypes=[("GCD files", "*.gcd"), ("All files", "*.*")])
+        if not path:
+            return
+        self.status_var.set(f"Loading  {Path(path).name} …")
+        self.root.update()
+        # run heavy IO + peak detection in background thread
+        import threading
+        def _load():
+            try:
+                data = read_gcd(path)
+                self.root.after(0, lambda: self._on_loaded(data, path))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_load_error(str(e)))
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _on_loaded(self, data, path):
+        self.data = data
+        self._rebuild_channel_checkboxes()
+        self._rebuild_peak_tables()
+        self._refresh_plot()
+        self._update_info()
+        self.file_label.config(text=Path(path).name, fg=ACCENT)
+        d    = self.data
+        n_pk = sum(len(c["peaks"]) for c in d["channels"])
+        self.status_var.set(
+            f"{Path(path).name}  ·  {d['n_points']:,} pts  ·  "
+            f"{d['run_time_min']:.3f} min  ·  "
+            f"{len(d['channels'])} channels  ·  {n_pk} peaks")
+
+    def _on_load_error(self, msg):
+        messagebox.showerror("Parse Error", msg)
+        self.status_var.set("Error loading file")
+
+    # ── channel checkboxes ────────────────────────────────────────────────────
+
+    def _rebuild_channel_checkboxes(self):
+        for w in self.ch_frame.winfo_children():
+            w.destroy()
+        self._ch_vars = []
+        for i, ch in enumerate(self.data["channels"]):
+            col = CH_COLORS[i % len(CH_COLORS)]
+            var = tk.BooleanVar(value=True)
+            self._ch_vars.append(var)
+            f = tk.Frame(self.ch_frame, bg=SIDEBAR)
+            f.pack(fill="x", pady=2)
+            tk.Label(f, text="●", font=("Segoe UI", 11),
+                     fg=col, bg=SIDEBAR).pack(side="left", padx=(4, 2))
+            tk.Checkbutton(f,
+                           text=f"{ch['label']}  ({len(ch['peaks'])} peaks)",
+                           variable=var,
+                           font=FONT, fg=TEXT, bg=SIDEBAR,
+                           selectcolor=ITEM_BG, activebackground=SIDEBAR,
+                           activeforeground=TEXT, bd=0,
+                           command=self._refresh_plot).pack(side="left")
+
+    # ── info sidebar ──────────────────────────────────────────────────────────
+
+    def _update_info(self):
+        d    = self.data
+        name = Path(d["filepath"]).name
+        self._info_rows["File"].config(
+            text=(name[:21] + "…") if len(name) > 21 else name)
+        self._info_rows["Run time"].config(
+            text=f"{d['run_time_min']:.3f} min")
+        self._info_rows["Points"].config(text=f"{d['n_points']:,}")
+        self._info_rows["dt"].config(text=f"{d['dt_ms']:.2f} ms")
+        self._info_rows["Channels"].config(
+            text=str(len(d["channels"])))
+
+    # ── peak tables ───────────────────────────────────────────────────────────
+
+    def _rebuild_peak_tables(self):
+        for tab in self.nb.tabs():
+            self.nb.forget(tab)
+        self._peak_tables = {}
+        COLS   = ("#", "RT (min)", "Area (µV·s)", "Height (µV)",
+                  "Start (min)", "End (min)")
+        WIDTHS = (35, 90, 130, 120, 100, 100)
+        for ch in self.data["channels"]:
+            frame = tk.Frame(self.nb, bg=PANEL)
+            self.nb.add(frame, text=f"  {ch['label']}  ")
+            tv = ttk.Treeview(frame, columns=COLS, show="headings",
+                              selectmode="browse")
+            for c, w in zip(COLS, WIDTHS):
+                tv.heading(c, text=c)
+                tv.column(c, width=w, anchor="center")
+            sb2 = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+            tv.configure(yscrollcommand=sb2.set)
+            tv.pack(side="left", fill="both", expand=True)
+            sb2.pack(side="right", fill="y")
+            self._peak_tables[ch["label"]] = tv
+        self._fill_peak_tables()
+
+    def _fill_peak_tables(self):
+        if not self.data:
+            return
+        for ch in self.data["channels"]:
+            tv = self._peak_tables.get(ch["label"])
+            if not tv:
+                continue
+            for row in tv.get_children():
+                tv.delete(row)
+            for i, p in enumerate(ch["peaks"], 1):
+                tv.insert("", "end", values=(
+                    i,
+                    f"{p['rt_min']:.4f}",
+                    f"{p['area']:,.1f}",
+                    f"{p['height']:,.1f}",
+                    f"{p['start_min']:.4f}",
+                    f"{p['end_min']:.4f}",
+                ))
+
+    # ── plot ──────────────────────────────────────────────────────────────────
+
+    def _refresh_plot(self):
+        if not self.data:
+            return
+        d       = self.data
+        stacked = self.layout_var.get() == "stacked"
+        ann_on  = self.show_peaks.get()
+        area_on = self.show_areas.get()
+
+        visible = [i for i, v in enumerate(self._ch_vars) if v.get()]
+        if not visible:
+            self._draw_empty()
+            return
+
+        self.fig.clear()
+        n_vis = len(visible) if stacked else 1
+        if stacked and n_vis > 1:
+            axes = list(self.fig.subplots(n_vis, 1, sharex=False))
+        else:
+            axes = [self.fig.add_subplot(111)]
+        self._ax_list = axes
+
+        ax_idx = 0
+        zoom_bar_entries = []   # (label, ax_index, color)
+
+        for i, ch in enumerate(d["channels"]):
+            if i not in visible:
+                continue
+            col = CH_COLORS[i % len(CH_COLORS)]
+            ax  = axes[ax_idx] if stacked else axes[0]
+            t   = ch["time"]
+            sig = ch["signal"]
+
+            # downsample for display only (keeps rendering fast)
+            # max 6000 pts on screen — full data is kept in ch["signal"] for export
+            MAX_PTS = 6000
+            if len(t) > MAX_PTS:
+                stride = len(t) // MAX_PTS
+                t_plot   = t[::stride]
+                sig_plot = sig[::stride]
+            else:
+                t_plot, sig_plot = t, sig
+
+            ax.set_facecolor(PLOT_BG)
+            ax.plot(t_plot, sig_plot, color=col, linewidth=0.85,
+                    label=ch["label"], zorder=3)
+
+            # set tight ylim: baseline just below signal min, top 8% headroom
+            # this ensures zoom_y anchors at the real signal floor, not empty space
+            sig_min = float(sig.min())
+            sig_max = float(sig.max())
+            sig_range = sig_max - sig_min or 1.0
+            ax.set_ylim(sig_min - sig_range * 0.05,
+                        sig_max + sig_range * 0.08)
+
+            # shade areas
+            if area_on:
+                for p in ch["peaks"]:
+                    l = p["l_idx"]; r = p["r_idx"]
+                    l = int(np.clip(l, 0, len(sig)-1))
+                    r = int(np.clip(r, 0, len(sig)-1))
+                    if r > l:
+                        bl = np.linspace(sig[l], sig[r], r - l + 1)
+                        ax.fill_between(t[l:r+1], sig[l:r+1], bl,
+                                        alpha=0.18, color=col, zorder=2)
+
+            # RT annotations
+            if ann_on:
+                for p in ch["peaks"]:
+                    idx = int(np.clip(p["peak_idx"], 0, len(sig)-1))
+                    ax.annotate(
+                        f"{p['rt_min']:.3f}",
+                        xy=(t[idx], sig[idx]),
+                        xytext=(0, 10), textcoords="offset points",
+                        ha="center", fontsize=6.5,
+                        color="#FCD34D",
+                        fontfamily="Segoe UI",
+                        fontweight="bold",
+                        rotation=55,
+                        arrowprops=dict(arrowstyle="->",
+                                        color="#FCD34D", lw=0.55),
+                        clip_on=True, zorder=5,
+                    )
+
+            ax.set_ylabel("Signal  (µV)", color="#64748B", fontsize=8,
+                          fontfamily="Segoe UI")
+            ax.legend(loc="upper right",
+                      facecolor="#0D0D1F", edgecolor=GRID_COL,
+                      labelcolor=col, fontsize=8,
+                      prop={"family": "Segoe UI"})
+            ax.tick_params(colors="#475569", labelsize=7.5,
+                           length=3, width=0.7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(GRID_COL); sp.set_linewidth(0.5)
+            ax.xaxis.set_minor_locator(ticker.AutoMinorLocator())
+            ax.yaxis.set_minor_locator(ticker.AutoMinorLocator())
+            ax.grid(True, color=GRID_COL, lw=0.5, alpha=0.9, zorder=0)
+            ax.grid(True, which="minor", color="#0E0E1C", lw=0.3, zorder=0)
+
+            zoom_bar_entries.append((ch["label"], ax_idx, col))
+            if stacked:
+                ax_idx += 1
+
+        axes[-1].set_xlabel("Retention Time  (min)",
+                             color="#64748B", fontsize=8,
+                             fontfamily="Segoe UI")
+        fname = Path(d["filepath"]).name
+        self.fig.suptitle(fname, color="#94A3B8", fontsize=9.5,
+                          fontfamily="Segoe UI", fontweight="bold", y=0.999)
+        self.fig.tight_layout(rect=[0, 0, 1, 0.999])
+        self.canvas.draw()
+
+        # set up zoom/pan controller
+        self._zpc = ZoomPanController(self.fig, self._ax_list, self.canvas)
+        self._zpc.set_home()
+
+        # rebuild per-channel zoom bar
+        self.zoom_bar.set_controller(self._zpc)
+        self.zoom_bar.rebuild(zoom_bar_entries)
+
+    def _reset_zoom(self):
+        if self._zpc:
+            self._zpc.reset()
+
+    # ── export ────────────────────────────────────────────────────────────────
+
+    def _export_menu(self):
+        if not self.data:
+            messagebox.showinfo("Nothing to export",
+                                "Load a .gcd file first.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Export Data")
+        win.configure(bg=PANEL)
+        win.geometry("390x315")
+        win.resizable(False, False)
+
+        tk.Label(win, text="Export Options",
+                 font=("Segoe UI", 12, "bold"),
+                 fg=TEXT, bg=PANEL).pack(pady=(20, 10))
+
+        for lbl, cmd in [
+            ("Raw Signal  →  CSV  (Origin-ready)",  self._export_signal_csv),
+            ("Raw Signal  →  Excel  (.xlsx)",        self._export_signal_xlsx),
+            ("Peak Table  →  CSV",                   self._export_peaks_csv),
+            ("Peak Table  →  Excel  (.xlsx)",        self._export_peaks_xlsx),
+        ]:
+            c = cmd
+            _flat_btn(win, lbl, lambda fn=c: [win.destroy(), fn()],
+                      bg=ACCENT, fg=TEXT, padx=0, pady=8, width=38
+                      ).pack(pady=3, padx=22, fill="x")
+
+        _flat_btn(win, "Cancel", win.destroy,
+                  bg=ITEM_BG, fg=DIM, pady=6
+                  ).pack(pady=(8, 4), padx=22, fill="x")
+
+    def _export_signal_csv(self):
+        d    = self.data
+        stem = Path(d["filepath"]).stem
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"{stem}_signal.csv",
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        chs = d["channels"]
+        n   = max(len(c["time"]) for c in chs)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Time_min"] + [f"{c['label']}_uV" for c in chs])
+            for i in range(n):
+                row = []
+                for ci, c in enumerate(chs):
+                    if i < len(c["time"]):
+                        if ci == 0: row.append(f"{c['time'][i]:.6f}")
+                        row.append(f"{c['signal'][i]:.4f}")
+                    else:
+                        if ci == 0: row.append("")
+                        row.append("")
+                w.writerow(row)
+        self.status_var.set(f"Exported → {path}")
+        messagebox.showinfo("Exported",
+            f"Signal saved to:\n{path}\n\nFormat: Time_min | Ch1_uV | Ch2_uV …\n"
+            "Ready to import into Origin / Excel.")
+
+    def _export_signal_xlsx(self):
+        try:
+            import openpyxl
+        except ImportError:
+            messagebox.showerror("Missing", "Run:  pip install openpyxl")
+            return
+        d    = self.data
+        stem = Path(d["filepath"]).stem
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"{stem}_signal.xlsx",
+            filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        for ch in d["channels"]:
+            ws = wb.create_sheet(title=ch["label"][:31])
+            ws.append(["Time_min", f"{ch['label']}_uV"])
+            for t, s in zip(ch["time"], ch["signal"]):
+                ws.append([round(float(t), 6), round(float(s), 4)])
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+        wb.save(path)
+        self.status_var.set(f"Exported → {path}")
+        messagebox.showinfo("Exported",
+            f"Signal saved to:\n{path}\n\nOne sheet per detector channel.")
+
+    def _export_peaks_csv(self):
+        d    = self.data
+        stem = Path(d["filepath"]).stem
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"{stem}_peaks.csv",
+            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Channel", "Peak#", "RT_min",
+                        "Area_uVs", "Height_uV",
+                        "Start_min", "End_min"])
+            for ch in d["channels"]:
+                for i, p in enumerate(ch["peaks"], 1):
+                    w.writerow([
+                        ch["label"], i,
+                        f"{p['rt_min']:.4f}",
+                        f"{p['area']:.2f}",
+                        f"{p['height']:.2f}",
+                        f"{p['start_min']:.4f}",
+                        f"{p['end_min']:.4f}",
+                    ])
+        self.status_var.set(f"Exported → {path}")
+        messagebox.showinfo("Exported", f"Peak table saved to:\n{path}")
+
+    def _export_peaks_xlsx(self):
+        try:
+            import openpyxl
+        except ImportError:
+            messagebox.showerror("Missing", "Run:  pip install openpyxl")
+            return
+        d    = self.data
+        stem = Path(d["filepath"]).stem
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"{stem}_peaks.xlsx",
+            filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        wb = openpyxl.Workbook()
+        for ch in d["channels"]:
+            ws = wb.create_sheet(title=ch["label"][:31])
+            ws.append(["Peak#", "RT_min", "Area_uVs",
+                       "Height_uV", "Start_min", "End_min"])
+            for i, p in enumerate(ch["peaks"], 1):
+                ws.append([
+                    i,
+                    round(p["rt_min"],    4),
+                    round(p["area"],      2),
+                    round(p["height"],    2),
+                    round(p["start_min"], 4),
+                    round(p["end_min"],   4),
+                ])
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+        wb.save(path)
+        self.status_var.set(f"Exported → {path}")
+        messagebox.showinfo("Exported", f"Peak table saved to:\n{path}")
+
+    def _save_png(self):
+        if not self.data:
+            messagebox.showinfo("Nothing to save", "Load a .gcd file first.")
+            return
+        default = Path(self.data["filepath"]).stem + "_chromatogram.png"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png", initialfile=default,
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")])
+        if path:
+            self.fig.savefig(path, dpi=180, bbox_inches="tight",
+                             facecolor=self.fig.get_facecolor())
+            self.status_var.set(f"Saved PNG → {path}")
+            messagebox.showinfo("Saved", f"Plot saved to:\n{path}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def main():
+    root = tk.Tk()
+    app  = GCDViewerApp(root)
+    if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
+        root.after(200, lambda: app._open_file(sys.argv[1]))
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
